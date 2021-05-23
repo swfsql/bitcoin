@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use t1ha::T1haHashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f = std::fs::read_to_string("data_test").unwrap();
 
-    let mut d = HashMap::new();
+    let mut d = T1haHashMap::default();
 
     for l in f.lines() {
         let v: Vec<&str> = l.trim().split(' ').collect();
