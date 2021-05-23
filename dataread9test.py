@@ -1,6 +1,6 @@
 d={}					# d will be ~60GB in ram
 
-with open('dt','r') as f:	# 200GB csv file
+with open('datatest','r') as f:	# 200GB csv file
  for l in f: 				# ~700,000 lines
   v=l.split(" ") 			# v contains thousands of items
   b=int(v[0])
