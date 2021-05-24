@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let f = std::fs::read_to_string("data_test").unwrap();
+    let f = std::fs::read_to_string("data_test")?;
 
     let mut d = BTreeMap::new();
 
@@ -13,21 +13,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let v = &v[4..];
         let del_keys = &v[0..cleanup_len];
-        let keys_values = &v[cleanup_len..];
-        let values = &keys_values[..values_len];
-        let keys = &keys_values[values_len..];
-
-        // dbg!(&del_keys);
-        // dbg!(&keys_values);
-        // dbg!(&keys);
-        // dbg!(&values);
+        let values_and_keys = &v[cleanup_len..];
+        let values = &values_and_keys[..values_len];
+        let keys = &values_and_keys[values_len..];
 
         let del_keys: Vec<(u128, u128, u8)> = del_keys
             .iter()
             .map(|k| {
                 let upper = u128::from_str_radix(&k[0..32], 16)?;
                 let lower = u128::from_str_radix(&k[32..64], 16)?;
-                let tail: u8 = (&k[64..]).parse()?;
+                let tail = u8::from_str_radix(&k[64..], 16)?;
                 Ok((upper, lower, tail))
             })
             .collect::<Result<_, std::num::ParseIntError>>()?;
@@ -42,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|k| {
                 let upper = u128::from_str_radix(&k[0..32], 16)?;
                 let lower = u128::from_str_radix(&k[32..64], 16)?;
-                let tail: u8 = (&k[64..]).parse()?;
+                let tail = u8::from_str_radix(&k[64..], 16)?;
                 Ok((upper, lower, tail))
             })
             .collect::<Result<_, std::num::ParseIntError>>()?;
