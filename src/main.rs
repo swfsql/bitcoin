@@ -1,9 +1,9 @@
-use t1ha::T1haHashMap;
+use std::collections::BTreeMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f = std::fs::read_to_string("data_test").unwrap();
 
-    let mut d = T1haHashMap::default();
+    let mut d = BTreeMap::new();
 
     for l in f.lines() {
         let v: Vec<&str> = l.trim().split(' ').collect();
