@@ -4,9 +4,11 @@ cargo-features = ["named-profiles"]
 name = "read-test"
 version = "0.1.0"
 edition = "2018"
-
+default-run = "read-test"
 
 [dependencies]
+thiserror = "1.0.25"
+structopt = "0.3.21"
 
 [features]
 profiling = []
@@ -14,7 +16,7 @@ default = []
 
 [dependencies.tokio]
 version = "1.6.0"
-features = ["fs", "io-util", "macros", "rt"]
+features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"]
 
 [profile.release-profile]
 inherits = "release"
