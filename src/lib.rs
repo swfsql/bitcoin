@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, convert::TryFrom};
 use tokio::io::AsyncBufReadExt;
+use tracing::{debug, info, Instrument};
 
 #[derive(Clone, Debug, structopt::StructOpt)]
 pub struct Config {
@@ -7,21 +8,33 @@ pub struct Config {
     #[structopt(long, parse(from_os_str), default_value = "data_test")]
     pub path: std::path::PathBuf,
 
+    /// Limits how many worker threads to use.
+    #[structopt(long, default_value = "2")]
+    pub threads: u16,
+
     /// Limits how many read lines may be awaiting to be parsed.
-    #[structopt(long, default_value = "30")]
+    #[structopt(long, default_value = "400")]
     pub read: u16,
 
     /// Limits how many parsed lines may be awaiting to be included in the dictionary.
-    #[structopt(long, default_value = "40")]
+    #[structopt(long, default_value = "400")]
     pub parsed: u16,
+
+    /// Limits how many dictionaries may be build in parallel.
+    #[structopt(long, default_value = "1")]
+    pub dicts: u16,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        // use structopt::StructOpt;
+        // Self::from_args()
         Config {
+            threads: 2,
             path: "data_test".into(),
-            read: 30,
-            parsed: 40,
+            read: 400,
+            parsed: 400,
+            dicts: 1,
         }
     }
 }
@@ -40,20 +53,28 @@ pub struct Value {
 }
 
 #[derive(Debug)]
-struct LineItem {
+pub struct LineItem {
     pub keys: Vec<Key>,
     pub values: Vec<Value>,
     pub del_keys: Vec<Key>,
 }
 
 impl LineItem {
-    pub fn consume(self, dict: &mut BTreeMap<Key, Value>) {
+    /// tries to insert the key/values and also to clean-up some keys
+    /// accordingly to `del_keys`.
+    ///
+    /// Returns the keys that were not found during clean-up.
+    pub fn consume(self, dict: &mut BTreeMap<Key, Value>) -> Vec<Key> {
         for (key, value) in self.keys.into_iter().zip(self.values.into_iter()) {
             dict.insert(key, value);
         }
+        let mut not_found = vec![];
         for del_key in self.del_keys.into_iter() {
-            dict.remove(&del_key);
+            if dict.remove(&del_key).is_none() {
+                not_found.push(del_key);
+            };
         }
+        not_found
     }
 }
 
@@ -121,44 +142,159 @@ pub enum Error {
     IoError(#[from] std::io::Error),
 }
 
-// data_test
-pub async fn run(config: Config) -> Result<BTreeMap<Key, Value>, Error> {
+// TODO: actually use SPSC.
+/// Creates a SPSC-style channel.
+///
+/// For `count = 3`, it returns senders/receivers for the tasks
+/// `[0]->[1]->[2]->[0]`.  
+/// That is, the first index is supposed to be used by the first task,
+/// and it contains a sender into the task `[1]`, and also a receiver from
+/// task `[2]`.
+pub fn ring_formation<T>(
+    count: usize,
+    buffer_qty: usize,
+) -> Vec<(tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>)> {
+    let mut tx = vec![];
+    let mut rx = vec![];
+    for _i in 0..count {
+        let (t, r) = tokio::sync::mpsc::channel::<T>(buffer_qty);
+        tx.push(t);
+        rx.push(r);
+    }
+    for i in (0..count).rev().skip(1).rev() {
+        tx.swap(i, (i + 1) % count);
+        rx.swap(count - i - 1, count - i - 2);
+    }
+    tx.into_iter().zip(rx.into_iter()).collect()
+}
+
+pub async fn run(config: Config) -> Result<Vec<BTreeMap<Key, Value>>, Error> {
     let path = config.path;
+
+    // TODO: sender is SP; still try actually having MC.
     let (parser_tx, mut parser_rx) = tokio::sync::mpsc::channel::<String>(config.read as usize);
     // line reader task
-    tokio::spawn(async move {
-        let f = tokio::fs::File::open(path).await?;
+    tokio::spawn(
+        async move {
+            info!("opening file");
+            let f = tokio::fs::File::open(path).await?;
 
-        let f = tokio::io::BufReader::new(f);
-        let mut lines = f.lines();
+            let f = tokio::io::BufReader::new(f);
+            let mut lines = f.lines();
 
-        while let Some(l) = lines.next_line().await? {
-            parser_tx.send(l).await.unwrap();
+            let mut count: usize = 0;
+            while let Some(l) = lines.next_line().await? {
+                debug!("read line {}", count);
+                count += 1;
+                parser_tx.send(l).await.unwrap();
+            }
+            info!("closing file");
+            Result::<(), Error>::Ok(())
         }
-        Result::<(), Error>::Ok(())
-    });
+        .instrument(tracing::info_span!("line_reader")),
+    );
 
-    let (inserter_tx, mut inserter_rx) =
-        tokio::sync::mpsc::channel::<LineItem>(config.parsed as usize);
+    let (inserter_tx, inserter_rx) = async_channel::bounded::<LineItem>(config.parsed as usize);
     // line parser task
-    tokio::spawn(async move {
-        while let Some(l) = parser_rx.recv().await {
-            let l = LineItem::try_from(l.as_ref())?;
-            inserter_tx.send(l).await.unwrap();
+    // TODO: try having multiple of this
+    tokio::spawn(
+        async move {
+            info!("starting");
+            let mut count: usize = 0;
+            while let Some(l) = parser_rx.recv().await {
+                let l = LineItem::try_from(l.as_ref())?;
+                debug!("parsed line {}", count);
+                count += 1;
+                inserter_tx.send(l).await.unwrap();
+            }
+            info!("finished");
+            Result::<(), Error>::Ok(())
         }
-        Result::<(), Error>::Ok(())
-    });
+        .instrument(tracing::info_span!("line_parser")),
+    );
 
     // dict inserter/remover task
-    let d = tokio::spawn(async move {
-        let mut d = BTreeMap::new();
-        while let Some(l) = inserter_rx.recv().await {
-            l.consume(&mut d);
-        }
-        d
-    })
-    .await
-    .unwrap();
 
-    Ok(d)
+    let handles = futures::stream::FuturesUnordered::new();
+    let mut removal_channels = ring_formation::<Key>(config.dicts as usize, 30);
+    removal_channels.reverse();
+
+    for id in 0..config.dicts {
+        // TODO: SPSC
+        let (removal_tx, mut removal_rx) = removal_channels.pop().unwrap();
+        let inserter_rx = inserter_rx.clone();
+        let mut remaining_removal_keys = vec![];
+
+        let handle = tokio::spawn(
+            async move {
+                // info!("starting");
+
+                let mut d = BTreeMap::new();
+                let mut previous_task_dropped = false;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        rm = removal_rx.recv(), if !previous_task_dropped => {
+                            if let Some(rm) = rm {
+                                if d.remove(&rm).is_none() {
+                                    match removal_tx.send(rm).await {
+                                        Ok(_) => (),
+                                        // the next/receiver task has dropped it's
+                                        // receiver end (which would receive from
+                                        // this sender)
+                                        Err(rm) => {
+                                            remaining_removal_keys.push(rm.0);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // the previous task has dropped it's sender
+                                // end (which would send into this receiver)
+                                previous_task_dropped = true;
+                            }
+                        }
+                        line_item = inserter_rx.recv() => {
+                            if let Ok(line_item) = line_item {
+                                line_item.consume(&mut d);
+                            } else {
+                                // the item sender has been dropped
+                                // (no more items will be produced)
+                                break;
+                            }
+                        }
+                        else => {
+                            unreachable!();
+                        }
+                    };
+                }
+
+                // info!("finished");
+
+                // each task end up with a dict, and also some keys
+                // that will be used as a cleanup for other tasks
+                // (the channels were disengaged before those keys
+                // could be sent)
+                (d, remaining_removal_keys)
+            }
+            .instrument(tracing::info_span!("handler", id)),
+        );
+        handles.push(handle);
+    }
+
+    let (mut ds, removals): (Vec<_>, Vec<_>) = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .unzip();
+    let removals: Vec<Key> = removals.into_iter().flatten().collect();
+    info!("remaining removals: {}", removals.len());
+    for d in &mut ds {
+        for rm in &removals {
+            d.remove(rm);
+        }
+    }
+    Ok(ds)
 }
